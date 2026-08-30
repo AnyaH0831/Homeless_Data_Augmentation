@@ -335,14 +335,27 @@ def extract_aggregates(df: pd.DataFrame) -> dict:
     # Semantic fallbacks for schema differences across years
     agg["total_surveyed"] = max(agg.get("total_surveyed", 0.0),
         _find_value(df, question_terms=("total surveys completed",), meta_value_terms=("count",)))
-    agg["years_homeless_avg"] = max(agg.get("years_homeless_avg", 0.0),
-        _find_value(df, question_terms=("how long you have been homeless",), meta_value_terms=("average",)))
-    agg["age_avg"] = max(agg.get("age_avg", 0.0),
-        _find_value(df, question_terms=("how old are you",), meta_value_terms=("average",)))
+    
+    # Years homeless — handle 2013 (1_YEARSHOMELESS), 2018 (4_TIMEHOMELESSAVERAGE in days), 2021 (4_YearHomelessAverage)
+    yh_2013 = from_rows("1_YEARSHOMELESS", "1_YEARSHOMELESSAVERAGE")
+    yh_2018 = from_rows("4_TIMEHOMELESSAVERAGE") / 365.0  # Convert days to years
+    yh_fallback = _find_value(df, question_terms=("how long you have been homeless",), meta_value_terms=("average",))
+    agg["years_homeless_avg"] = max(agg.get("years_homeless_avg", 0.0), yh_2013, yh_2018, yh_fallback)
+    
+    # Age — handle 2013 (3_AGE), 2018 (2_AGEAVERAGE), 2021 (2_AgeAverage)
+    age_2013 = from_rows("3_AGE")
+    age_2018 = from_rows("2_AGEAVERAGE")
+    age_fallback = _find_value(df, question_terms=("how old are you",), meta_value_terms=("average",))
+    agg["age_avg"] = max(agg.get("age_avg", 0.0), age_2013, age_2018, age_fallback)
+    
+    # Gender — handle 2013 (4_MALE/FEMALE), 2018 (15_MALE/FEMALE)
     agg["n_male"] = max(agg.get("n_male", 0.0),
+        from_rows("4_MALE", "15_MALE"),
         _find_value(df, question_terms=("gender",), response_terms=("male",), meta_value_terms=("count",)))
     agg["n_female"] = max(agg.get("n_female", 0.0),
+        from_rows("4_FEMALE", "15_FEMALE"),
         _find_value(df, question_terms=("gender",), response_terms=("female",), meta_value_terms=("count",)))
+    
     agg["n_mental_health"] = max(agg.get("n_mental_health", 0.0),
         _find_value(df, question_terms=("mental health",), response_terms=("yes",), meta_value_terms=("count",)))
     agg["n_substance_use"] = max(agg.get("n_substance_use", 0.0),
