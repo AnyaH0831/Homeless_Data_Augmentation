@@ -31,12 +31,16 @@ v3 NEW FIX — MH/SU joint constraint:
 
 import itertools
 import warnings
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import lsq_linear
 from scipy.linalg import cholesky
 from scipy.stats import norm as sp_norm
+
+# Module directory for saving outputs relative to this file
+MODULE_DIR = Path(__file__).resolve().parent
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
@@ -49,12 +53,14 @@ MH_SU_TARGET_CORR = 0.45
 # ── STEP 1: ATTRIBUTE SPACE ───────────────────────────────────────────────────
 
 OPTIMIZED_ATTRS = [
-    ("gender",        ["male", "female", "trans_nonbinary"]),
-    ("race",          ["black", "white", "indigenous", "other"]),
-    ("mental_health", [1, 0]),
-    ("substance_use", [1, 0]),
-    ("outdoor_sleep", [1, 0]),
-    ("chronic",       [1, 0]),
+    ("gender",         ["male", "female", "trans_nonbinary"]),
+    ("race",           ["black", "white", "indigenous", "other"]),
+    ("education",      ["less_than_hs", "hs_graduate", "some_post_sec", "post_sec_higher"]),
+    ("has_dependents", [1, 0]),
+    ("mental_health",  [1, 0]),
+    ("substance_use",  [1, 0]),
+    ("outdoor_sleep",  [1, 0]),
+    ("chronic",        [1, 0]),
 ]
 
 ALL_COMBINATIONS = [
@@ -72,21 +78,26 @@ def build_W_and_constraint_names():
     Includes a joint MH+SU constraint row to enforce co-occurrence correlation.
     """
     constraints = [
-        ("n_male",            lambda c: c["gender"] == "male"),
-        ("n_female",          lambda c: c["gender"] == "female"),
-        ("n_trans_nonbinary", lambda c: c["gender"] == "trans_nonbinary"),
-        ("n_black",           lambda c: c["race"] == "black"),
-        ("n_white",           lambda c: c["race"] == "white"),
-        ("n_indigenous",      lambda c: c["race"] == "indigenous"),
-        ("n_other_race",      lambda c: c["race"] == "other"),
-        ("n_mental_health",   lambda c: c["mental_health"] == 1),
-        ("n_substance_use",   lambda c: c["substance_use"] == 1),
+        ("n_male",             lambda c: c["gender"] == "male"),
+        ("n_female",           lambda c: c["gender"] == "female"),
+        ("n_trans_nonbinary",  lambda c: c["gender"] == "trans_nonbinary"),
+        ("n_black",            lambda c: c["race"] == "black"),
+        ("n_white",            lambda c: c["race"] == "white"),
+        ("n_indigenous",       lambda c: c["race"] == "indigenous"),
+        ("n_other_race",       lambda c: c["race"] == "other"),
+        ("n_less_than_hs",     lambda c: c["education"] == "less_than_hs"),
+        ("n_hs_graduate",      lambda c: c["education"] == "hs_graduate"),
+        ("n_some_post_sec",    lambda c: c["education"] == "some_post_sec"),
+        ("n_post_sec_higher",  lambda c: c["education"] == "post_sec_higher"),
+        ("n_has_dependents",   lambda c: c["has_dependents"] == 1),
+        ("n_mental_health",    lambda c: c["mental_health"] == 1),
+        ("n_substance_use",    lambda c: c["substance_use"] == 1),
         # Joint constraint: both MH=1 AND SU=1
         # This row tells the optimizer how many people should have BOTH
-        ("n_mh_and_su",       lambda c: c["mental_health"] == 1 and c["substance_use"] == 1),
-        ("n_outdoor",         lambda c: c["outdoor_sleep"] == 1),
-        ("n_chronic",         lambda c: c["chronic"] == 1),
-        ("total_surveyed",    lambda c: True),
+        ("n_mh_and_su",        lambda c: c["mental_health"] == 1 and c["substance_use"] == 1),
+        ("n_outdoor",          lambda c: c["outdoor_sleep"] == 1),
+        ("n_chronic",          lambda c: c["chronic"] == 1),
+        ("total_surveyed",     lambda c: True),
     ]
     W = np.zeros((len(constraints), M), dtype=float)
     for i, (_, fn) in enumerate(constraints):
@@ -127,20 +138,25 @@ def extract_Y(row: pd.Series, target_total: int) -> np.ndarray:
     p_su = float(row.get("pct_substance_use",     0.28))
 
     y_dict = {
-        "n_male":            n * float(row.get("pct_male",             0.65)),
-        "n_female":          n * float(row.get("pct_female",           0.28)),
-        "n_trans_nonbinary": n * float(row.get("pct_trans_nonbinary",  0.04)),
-        "n_black":           n * float(row.get("pct_black",            0.30)),
-        "n_white":           n * float(row.get("pct_white",            0.30)),
-        "n_indigenous":      n * float(row.get("pct_indigenous",       0.18)),
-        "n_other_race":      n * float(row.get("pct_other_race",       0.22)),
-        "n_mental_health":   n * p_mh,
-        "n_substance_use":   n * p_su,
+        "n_male":             n * float(row.get("pct_male",              0.65)),
+        "n_female":           n * float(row.get("pct_female",            0.28)),
+        "n_trans_nonbinary":  n * float(row.get("pct_trans_nonbinary",   0.04)),
+        "n_black":            n * float(row.get("pct_black",             0.30)),
+        "n_white":            n * float(row.get("pct_white",             0.30)),
+        "n_indigenous":       n * float(row.get("pct_indigenous",        0.18)),
+        "n_other_race":       n * float(row.get("pct_other_race",        0.22)),
+        "n_less_than_hs":     n * float(row.get("pct_less_than_hs",     0.35)),
+        "n_hs_graduate":      n * float(row.get("pct_hs_graduate",       0.27)),
+        "n_some_post_sec":    n * float(row.get("pct_some_post_sec",    0.12)),
+        "n_post_sec_higher":  n * float(row.get("pct_post_sec_higher",  0.20)),
+        "n_has_dependents":   n * float(row.get("pct_has_dependents",   0.11)),
+        "n_mental_health":    n * p_mh,
+        "n_substance_use":    n * p_su,
         # Joint constraint: estimated from marginals + literature correlation
-        "n_mh_and_su":       n * estimate_joint_mh_su(p_mh, p_su),
-        "n_outdoor":         n * float(row.get("pct_outdoor_sleeping", 0.20)),
-        "n_chronic":         n * float(row.get("pct_chronic",          0.32)),
-        "total_surveyed":    n,
+        "n_mh_and_su":        n * estimate_joint_mh_su(p_mh, p_su),
+        "n_outdoor":          n * float(row.get("pct_outdoor_sleeping",  0.20)),
+        "n_chronic":          n * float(row.get("pct_chronic",           0.32)),
+        "total_surveyed":     n,
     }
     return np.array([y_dict[name] for name in CONSTRAINT_NAMES], dtype=float)
 
@@ -209,6 +225,8 @@ def expand_combinations_to_individuals(x, year, row):
                 "years_homeless":   round(float(yrs[i]),  2),
                 "gender":           combo["gender"],
                 "race":             combo["race"],
+                "education":        combo["education"],
+                "has_dependents":   combo["has_dependents"],
                 "mental_health":    combo["mental_health"],
                 "substance_use":    combo["substance_use"],
                 "outdoor_sleeping": combo["outdoor_sleep"],
@@ -258,6 +276,37 @@ def add_extra_binary_features(df: pd.DataFrame, row: pd.Series) -> pd.DataFrame:
     u      = sp_norm.cdf(z_corr)
     for i, feat in enumerate(EXTRA_BINARY_FEATURES):
         df[feat] = (u[:, i] < probs[feat]).astype(int)
+    
+    # Add income_type as categorical unconstrained feature
+    # Consolidated from survey: primary income source distribution
+    # If not extracted from survey, use reasonable defaults
+    try:
+        disability_val = float(row.get("pct_disability_income", 0.30))
+        employment_val = float(row.get("pct_employment_income", 0.08))
+        welfare_val = float(row.get("pct_welfare_income", 0.40))
+        informal_val = float(row.get("pct_informal_income", 0.05))
+        other_val = float(row.get("pct_other_income", 0.17))
+        
+        income_dist = np.array([disability_val, employment_val, welfare_val, informal_val, other_val], dtype=float)
+        # Ensure no NaN values
+        if np.any(~np.isfinite(income_dist)):
+            income_dist = np.array([0.3, 0.08, 0.4, 0.05, 0.17], dtype=float)
+        income_dist = income_dist / np.sum(income_dist)  # Normalize to sum to 1
+        
+        income_sources = np.random.choice(
+            ["disability", "employment", "welfare", "informal", "other"],
+            size=n,
+            p=income_dist
+        )
+    except Exception:
+        # Fallback to equal distribution
+        income_sources = np.random.choice(
+            ["disability", "employment", "welfare", "informal", "other"],
+            size=n
+        )
+    
+    df["income_type"] = income_sources
+    
     return df
 
 
@@ -270,6 +319,8 @@ def compute_sasm_quality(df_year: pd.DataFrame, y: np.ndarray) -> dict:
         mask = (
             (df_year["gender"]           == combo["gender"])        &
             (df_year["race"]             == combo["race"])          &
+            (df_year["education"]        == combo["education"])     &
+            (df_year["has_dependents"]   == combo["has_dependents"]) &
             (df_year["mental_health"]    == combo["mental_health"]) &
             (df_year["substance_use"]    == combo["substance_use"]) &
             (df_year["outdoor_sleeping"] == combo["outdoor_sleep"]) &
@@ -351,6 +402,7 @@ def generate_individuals_sasm(
         return pd.DataFrame()
 
     df_all = pd.concat(all_records, ignore_index=True)
-    pd.DataFrame(quality_log).to_csv("sasm_quality_log.csv", index=False)
-    print("Saved sasm_quality_log.csv")
+    quality_csv = MODULE_DIR / "sasm_quality_log.csv"
+    pd.DataFrame(quality_log).to_csv(quality_csv, index=False)
+    print(f"Saved {quality_csv}")
     return df_all

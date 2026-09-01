@@ -213,6 +213,34 @@ def compute_derived(agg: dict) -> dict:
         agg.get("n_first_nations", 0) + agg.get("n_metis", 0) + agg.get("n_inuit", 0)
     )
 
+    # NEW: Compute education percentages
+    edu_total = max(
+        agg.get("n_less_than_hs", 0) + agg.get("n_hs_graduate", 0) + 
+        agg.get("n_some_post_sec", 0) + agg.get("n_post_sec_higher", 0),
+        1
+    )
+    agg["pct_less_than_hs"] = float(np.clip(agg.get("n_less_than_hs", 0) / edu_total, 0.0, 1.0))
+    agg["pct_hs_graduate"] = float(np.clip(agg.get("n_hs_graduate", 0) / edu_total, 0.0, 1.0))
+    agg["pct_some_post_sec"] = float(np.clip(agg.get("n_some_post_sec", 0) / edu_total, 0.0, 1.0))
+    agg["pct_post_sec_higher"] = float(np.clip(agg.get("n_post_sec_higher", 0) / edu_total, 0.0, 1.0))
+    
+    # NEW: Compute dependents percentage
+    total_surveyed = max(agg.get("total_surveyed", 1), 1)
+    agg["pct_has_dependents"] = float(np.clip(agg.get("n_has_dependents", 0) / total_surveyed, 0.0, 1.0))
+    
+    # NEW: Compute income type percentages
+    income_total = max(
+        agg.get("n_disability_income", 0) + agg.get("n_employment_income", 0) +
+        agg.get("n_welfare_income", 0) + agg.get("n_informal_income", 0) +
+        agg.get("n_other_income", 0),
+        1
+    )
+    agg["pct_disability_income"] = float(np.clip(agg.get("n_disability_income", 0) / income_total, 0.0, 1.0))
+    agg["pct_employment_income"] = float(np.clip(agg.get("n_employment_income", 0) / income_total, 0.0, 1.0))
+    agg["pct_welfare_income"] = float(np.clip(agg.get("n_welfare_income", 0) / income_total, 0.0, 1.0))
+    agg["pct_informal_income"] = float(np.clip(agg.get("n_informal_income", 0) / income_total, 0.0, 1.0))
+    agg["pct_other_income"] = float(np.clip(agg.get("n_other_income", 0) / income_total, 0.0, 1.0))
+
     avg = max(agg.get("years_homeless_avg", 3.0), 0.1)
     agg["pct_chronic"] = float(np.clip(1 - np.exp(-avg / 3.5), 0.1, 0.9))
 
@@ -372,6 +400,38 @@ def extract_aggregates(df: pd.DataFrame) -> dict:
         _find_value(df, question_terms=("prison", "jail"), response_terms=("yes",), meta_value_terms=("count",)))
     agg["n_no_income"] = max(agg.get("n_no_income", 0.0),
         _find_value(df, question_terms=("income source",), response_terms=("no income",), meta_value_terms=("count",)))
+
+    # NEW: Extract education levels
+    n_less_than_hs = _find_value(df, question_terms=("education",), response_terms=("less than high school",), meta_value_terms=("count",))
+    n_hs_graduate = _find_value(df, question_terms=("education",), response_terms=("high school graduate",), meta_value_terms=("count",))
+    n_some_post_sec = _find_value(df, question_terms=("education",), response_terms=("some post-secondary",), meta_value_terms=("count",))
+    n_post_sec_higher = _find_value(df, question_terms=("education",), response_terms=("post-secondary or higher",), meta_value_terms=("count",))
+    
+    agg["n_less_than_hs"] = n_less_than_hs
+    agg["n_hs_graduate"] = n_hs_graduate
+    agg["n_some_post_sec"] = n_some_post_sec
+    agg["n_post_sec_higher"] = n_post_sec_higher
+    
+    # NEW: Extract dependents
+    n_has_dependents = _find_value(df, question_terms=("dependent",), response_terms=("yes",), meta_value_terms=("count",))
+    agg["n_has_dependents"] = n_has_dependents
+    
+    # NEW: Extract income types (consolidate multiple source types)
+    n_disability_income = _find_value(df, question_terms=("income source",), response_terms=("disability",), meta_value_terms=("count",))
+    n_employment_income = (_find_value(df, question_terms=("income source",), response_terms=("employment",), meta_value_terms=("count",)) +
+                           _find_value(df, question_terms=("income source",), response_terms=("full-time",), meta_value_terms=("count",)) +
+                           _find_value(df, question_terms=("income source",), response_terms=("part-time",), meta_value_terms=("count",)))
+    n_welfare_income = _find_value(df, question_terms=("income source",), response_terms=("welfare", "ontario works"), meta_value_terms=("count",))
+    n_informal_income = _find_value(df, question_terms=("income source",), response_terms=("informal",), meta_value_terms=("count",))
+    n_other_income = (_find_value(df, question_terms=("income source",), response_terms=("employment insurance", "child tax", "gst", "seniors",), meta_value_terms=("count",)) +
+                      _find_value(df, question_terms=("income source",), response_terms=("family", "friends",), meta_value_terms=("count",)) +
+                      _find_value(df, question_terms=("income source",), response_terms=("other",), meta_value_terms=("count",)))
+    
+    agg["n_disability_income"] = n_disability_income
+    agg["n_employment_income"] = n_employment_income
+    agg["n_welfare_income"] = n_welfare_income
+    agg["n_informal_income"] = n_informal_income
+    agg["n_other_income"] = n_other_income
 
     for (num_key, den_key), pct_key in RATIO_MAP.items():
         num = agg.get(num_key, 0.0)
