@@ -7,4 +7,7 @@
 
 # Ottawa Data:
 - Source data from Ottawa PIT
-- 
+
+
+# Lanark Data:
+- Cleaned Lanark data
