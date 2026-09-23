@@ -1,36 +1,77 @@
 """
 sna_pipeline_sasm.py
 ────────────────────
-NEW pipeline using SASM (Small Area Synthetic Microdata) optimization.
+Pipeline using SASM (Small Area Synthetic Microdata) optimization, built on
+Toronto's Street Needs Assessment (SNA) data for 2013, 2018, and 2021.
 
-HOW THIS DIFFERS FROM sna_pipeline.py (OLD PIPELINE)
-─────────────────────────────────────────────────────
-OLD:  generate_individuals()     — Gaussian copula probabilistic sampling
-      • Samples each person's attributes from marginal distributions
-      • Injects correlations via Cholesky decomposition
-      • Result is APPROXIMATELY consistent with SNA aggregates
+MAJOR REWRITE — YEAR-SPECIFIC EXTRACTION
+──────────────────────────────────────────
+Earlier versions of this file used a single ROW_MAP/RATIO_MAP built entirely
+around the 2021 survey's row-naming scheme (e.g. "26_GenderIdentityCount",
+"23_MentalHealthIssueYes") and assumed it would also work for 2013 and 2018.
+It does not: Toronto used three genuinely different questionnaires across
+these years, with different question numbers, different category structures,
+and (for 2013) some concepts not asked about at all. Verified against the
+actual uploaded xlsx files, this produced several serious, silent bugs:
 
-NEW:  generate_individuals_sasm() — Integer optimization (this file)
-      • Finds combination counts by solving: minimize ||WX' - Y||²
-      • Result is PROVABLY as close to SNA aggregates as the solver can get
-      • Verifiable quality metric: d_p = ||WX' - Y||² (printed per year)
+1. NO DENOMINATOR FALLBACK. None of the "_Count" denominator rows
+   (gender_count, health_count, race_count, etc.) exist under the expected
+   2021-style names in 2013/2018. When missing, the denominator silently
+   defaulted to 1.0, so e.g. pct_male = (real count)/1.0 exploded past 100%
+   and got clipped to exactly 1.0 — simultaneously with pct_female=1.0,
+   which is impossible in reality.
+2. EDUCATION WAS ENTIRELY MISSING for 2013 and 2018 (no fallback existed),
+   summing to 0% instead of 100% — since education is a hard partition in
+   the SASM attribute space, this alone forced a huge, unresolvable
+   inconsistency in the optimizer.
+3. "YEARS HOMELESS" WAS THE WRONG CONCEPT for 2018 AND 2021. The row being
+   used ("4_TIMEHOMELESSAVERAGE" / "4_YearHomelessAverage") actually answers
+   "how much time in the past 12 months have you experienced homelessness"
+   (bounded 0-12 months / 0-365 days), not lifetime years homeless. Feeding
+   this into the chronic-homelessness formula as if it were lifetime years
+   badly distorted pct_chronic for both years (2021's hit the 0.9 clip
+   ceiling). Only 2013 asked a genuine lifetime-years question directly.
+   Fixed by deriving years-homeless from (current age) - (age when first
+   experienced homelessness), which both 2018 and 2021 do ask directly.
+4. 2018's "outdoor sleeping" query matched the wrong question entirely — it
+   answers "where were you staying BEFORE you started using this winter
+   respite service" (a retrospective question about a small subgroup), not
+   "are you currently sleeping outdoors tonight."
+5. Even 2021 (previously the "good" year) mapped only 2 of 7 real education
+   categories, silently dropping the other 5 respondents' education levels
+   into an artificial 100%-of-2-categories renormalization that looked
+   internally consistent but was substantively wrong. It also computed race
+   by mixing two DIFFERENT survey questions with different denominators
+   (a dedicated Indigenous-identity question plus a separate racial-identity
+   question), which is avoided here by using the single racial-identity
+   question as the sole source for all four race categories.
 
-Everything else (data loading, interpolation, shelter flow calibration,
-forecasting model) is IDENTICAL to the old pipeline so results are
-directly comparable.
+NEW APPROACH: EXPORT-SHEET SECTOR COLUMNS FOR OUTDOOR SLEEPING
+─────────────────────────────────────────────────────────────
+Toronto's Export sheet has per-SECTOR columns (who was surveyed WHERE —
+e.g. OUTDOOR/OUTDOORS, MEN, WOMEN, FAMILY, YOUTH, ...) in all three years,
+which the previous version discarded (only ever reading a single "Total"
+column). pct_outdoor_sleeping is now computed directly and reliably from the
+TOTALSURVEYS row's OUTDOOR/OUTDOORS column value divided by its TOTAL column
+value — this works consistently across all three years, unlike trying to
+parse an inconsistently-worded survey question.
 
-Usage:
-    python sna_pipeline_sasm.py --local --local-flow source_data/toronto-shelter-system-flow.csv
-    # Default: observed totals (typically ~100k+ rows across all years)
-    
-    python sna_pipeline_sasm.py --local --local-flow source_data/toronto-shelter-system-flow.csv --use-observed-totals
-    # Generate individuals matching actual observed totals (~6400-8000 per year)
-    
-    python sna_pipeline_sasm.py --local --use-observed-totals --skip-model
-    # Generate synthetic data only without training the forecasting model
-    
-    # NOTE: Fixed sample-size mode has been removed.
-    # SASM now always uses observed/calibrated totals.
+DOCUMENTED DATA LIMITATIONS (not fixable from this source)
+────────────────────────────────────────────────────────────
+- 2013 has NO race/ethnicity breakdown beyond a simple Aboriginal-identity
+  yes/no question. pct_black and pct_white cannot be extracted for 2013;
+  they are set to 0.0 and pct_other_race absorbs the entire non-Indigenous
+  population, undifferentiated.
+- 2013 has NO education question, NO dependents question, and NO
+  immigrant/foster-care/incarceration/housing-loss-reason questions at all.
+  These use documented literature-informed defaults for that year only.
+- 2013 has NO direct "do you have a mental health issue / substance use
+  issue" question. The closest available signal is a *different* question —
+  "which of the following would help you find housing" — with "Mental
+  health supports" and "Help getting alcohol or drug treatment" as
+  checkbox options. This measures perceived SERVICE NEED, not clinical
+  self-identification, and is used only as a labeled best-available proxy
+  for 2013.
 """
 
 import argparse
@@ -43,14 +84,12 @@ import numpy as np
 import pandas as pd
 import requests
 
-# Import the SASM generator only.
 from sasm_generator import generate_individuals_sasm
 
 warnings.filterwarnings("ignore")
 np.random.seed(42)
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-# Identical to old pipeline — same data sources
 
 CKAN_BASE = "https://ckan0.cf.opendata.inter.prod-toronto.ca"
 
@@ -66,246 +105,420 @@ LOCAL_FILES = {
     2021: "source_data/2021-street-needs-assessment-results.xlsx",
 }
 
-# ── ROW MAPPING ───────────────────────────────────────────────────────────────
-# Identical to old pipeline
-
-ROW_MAP = {
-    "TotalSurveys":                          "total_surveyed",
-    "2_AgeAverage":                          "age_avg",
-    "2_AgeCount":                            "age_count",
-    "4_YearHomelessAverage":                 "years_homeless_avg",
-    "26_GenderIdentityCount":                "gender_count",
-    "26_GenderIdentityMale":                 "n_male",
-    "26_GenderIdentityFemale":               "n_female",
-    "26_GenderIdentityTransMale":            "n_trans_male",
-    "26_GenderIdentityTransFemale":          "n_trans_female",
-    "26_GenderIdentityTwoSpirit":            "n_two_spirit",
-    "26_GenderIdentityNonBinary":            "n_nonbinary",
-    "18_IndigenousCount":                    "indigenous_count",
-    "18_FirstNations":                       "n_first_nations",
-    "18_Metis":                              "n_metis",
-    "18_Inuit":                              "n_inuit",
-    "20_RaceEthnicityCount":                 "race_count",
-    "20_RaceEthnicityBlackCanadianAmerican": "n_black_cdn",
-    "20_RaceEthnicityBlackAfrican":          "n_black_african",
-    "20_RaceEthnicityBlackAfroCaribbean":    "n_black_caribbean",
-    "20_RaceEthnicityWhite":                 "n_white",
-    "23_HealthChallengesCount":              "health_count",
-    "23_MentalHealthIssueYes":               "n_mental_health",
-    "23_SubstanceUseIssueYes":               "n_substance_use",
-    "23_PhysicalLimitationYes":              "n_physical_health",
-    "9_OverNightLocationCount":              "overnight_count",
-    "9_OvernightLocationOutdoorsYes":        "n_outdoor",
-    "9_EmergencyShelterYes":                 "n_emergency_shelter",
-    "11_ImmigrantStatusCount":               "immigrant_count",
-    "11_Immigrant":                          "n_immigrant",
-    "11_Refugee":                            "n_refugee",
-    "11_RefugeeClaimant":                    "n_refugee_claimant",
-    "28_LGBTQS2Count":                       "lgbtq_count",
-    "28_Yes":                                "n_lgbtq",
-    "22_FosterCount":                        "foster_count",
-    "22_Yes":                                "n_foster",
-    "6_HousingLossCount":                    "housing_loss_count",
-    "6_HousingLossNotEnoughIncome":          "n_housing_loss_income",
-    "6_HousingLossMentalHealth":             "n_housing_loss_mental",
-    "6_HousingLossSubstanceUse":             "n_housing_loss_substance",
-    "29_IncomeCount":                        "income_count",
-    "29_IncomeNoIncome":                     "n_no_income",
-    "32_ServiceUseCount":                    "service_count",
-    "32_PrisonOrJailYes":                    "n_incarceration",
+# Literature-informed defaults used ONLY for concepts genuinely absent from
+# a given year's survey (documented per-field below), never to override real
+# extracted data.
+DEFAULT_EDUCATION = {  # renormalized to sum exactly to 1.0
+    "less_than_hs": 0.35 / 0.94,
+    "hs_graduate": 0.27 / 0.94,
+    "some_post_sec": 0.12 / 0.94,
+    "post_sec_higher": 0.20 / 0.94,
 }
-
-RATIO_MAP = {
-    ("n_male",                  "gender_count"):       "pct_male",
-    ("n_female",                "gender_count"):       "pct_female",
-    ("n_trans_male",            "gender_count"):       "pct_trans_male",
-    ("n_trans_female",          "gender_count"):       "pct_trans_female",
-    ("n_two_spirit",            "gender_count"):       "pct_two_spirit",
-    ("n_nonbinary",             "gender_count"):       "pct_nonbinary",
-    ("n_first_nations",         "indigenous_count"):   "pct_first_nations",
-    ("n_metis",                 "indigenous_count"):   "pct_metis",
-    ("n_inuit",                 "indigenous_count"):   "pct_inuit",
-    ("n_white",                 "race_count"):         "pct_white",
-    ("n_mental_health",         "health_count"):       "pct_mental_health",
-    ("n_substance_use",         "health_count"):       "pct_substance_use",
-    ("n_physical_health",       "health_count"):       "pct_physical_health",
-    ("n_outdoor",               "overnight_count"):    "pct_outdoor_sleeping",
-    ("n_emergency_shelter",     "overnight_count"):    "pct_emergency_shelter",
-    ("n_immigrant",             "immigrant_count"):    "pct_immigrant",
-    ("n_refugee",               "immigrant_count"):    "pct_refugee",
-    ("n_refugee_claimant",      "immigrant_count"):    "pct_refugee_claimant",
-    ("n_lgbtq",                 "lgbtq_count"):        "pct_lgbtq",
-    ("n_foster",                "foster_count"):       "pct_foster_care_history",
-    ("n_housing_loss_income",   "housing_loss_count"): "pct_housing_loss_income",
-    ("n_housing_loss_mental",   "housing_loss_count"): "pct_housing_loss_health",
-    ("n_housing_loss_substance","housing_loss_count"): "pct_housing_loss_substance",
-    ("n_no_income",             "income_count"):       "pct_no_income",
-    ("n_incarceration",         "service_count"):      "pct_incarceration_history",
-}
-
-PROPORTION_COLS = list(RATIO_MAP.values())
+DEFAULT_HAS_DEPENDENTS = 0.10   # 2018/2021 observed ~10-11%; 2013 has no such question
+DEFAULT_IMMIGRANT = 0.20
+DEFAULT_FOSTER_CARE = 0.12
+DEFAULT_INCARCERATION = 0.08
+DEFAULT_HOUSING_LOSS_INCOME = 0.35
+DEFAULT_HOUSING_LOSS_HEALTH = 0.15
 
 
-# ── DATA LOADING ──────────────────────────────────────────────────────────────
-# Identical to old pipeline — shared helper functions
+# ── LOW-LEVEL HELPERS ─────────────────────────────────────────────────────────
 
 def _normalize_text(value) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value).lower())
 
-def _pick_value_column(columns) -> str:
+
+def _pick_total_column(columns) -> str:
+    """Find the 'Total' / 'Total/Average' sector column among Export columns."""
     normalized = {_normalize_text(col): col for col in columns}
     for candidate in ("totalaverage", "total"):
         if candidate in normalized:
             return normalized[candidate]
-    for col in reversed(list(columns)):
-        if str(col).strip() and not str(col).startswith("Unnamed"):
-            return col
     return columns[-1]
 
-def _normalize_series(series: pd.Series) -> pd.Series:
-    return series.fillna("").astype(str).map(_normalize_text)
 
-def _find_value(df, *, row_terms=(), question_terms=(), response_terms=(),
-                meta_value_terms=(), sum_matches=False) -> float:
-    mask = pd.Series(True, index=df.index)
-    if row_terms:
-        row_norm = _normalize_series(df["row_name"])
-        for t in row_terms:
-            mask &= row_norm.str.contains(_normalize_text(t), na=False)
-    if question_terms and "question" in df.columns:
-        q_norm = _normalize_series(df["question"])
-        for t in question_terms:
-            mask &= q_norm.str.contains(_normalize_text(t), na=False)
-    if response_terms and "response" in df.columns:
-        r_norm = _normalize_series(df["response"])
-        for t in response_terms:
-            mask &= r_norm.str.contains(_normalize_text(t), na=False)
-    if meta_value_terms and "meta_value" in df.columns:
-        m_norm = _normalize_series(df["meta_value"])
-        for t in meta_value_terms:
-            mask &= m_norm.str.contains(_normalize_text(t), na=False)
-    matches = df.loc[mask, "value"].fillna(0.0)
-    if matches.empty:
+def _pick_outdoor_column(columns) -> str | None:
+    """Find the 'Outdoor' / 'Outdoors' sector column among Export columns."""
+    for col in columns:
+        if _normalize_text(col) in ("outdoor", "outdoors"):
+            return col
+    return None
+
+
+def load_sna_xlsx(source):
+    """
+    Parse Export + Key-Rows sheets into a merged DataFrame that retains ALL
+    sector columns from the Export sheet (not just a single picked "value"
+    column), so outdoor-sleeping can be read directly from the OUTDOOR/
+    OUTDOORS sector column rather than inferred from a survey question.
+
+    Returns (df, total_col, outdoor_col). df has one row per Key-Rows entry,
+    merged with all Export sector columns by row_name, plus a "value" column
+    that mirrors the Total/Total-Average column for backward-compatible
+    single-value lookups.
+    """
+    buf = io.BytesIO(source) if isinstance(source, bytes) else source
+    export = pd.read_excel(buf, sheet_name="Export")
+    export.columns = [str(c).strip() for c in export.columns]
+    row_col = export.columns[0]
+    sector_cols = list(export.columns[1:])
+    total_col = _pick_total_column(sector_cols)
+    outdoor_col = _pick_outdoor_column(sector_cols)
+    export = export.rename(columns={row_col: "row_name"})
+    for c in sector_cols:
+        export[c] = pd.to_numeric(export[c], errors="coerce")
+
+    key_rows = pd.read_excel(buf, sheet_name="Key-Rows")
+    key_rows.columns = [str(c).strip() for c in key_rows.columns]
+    key_rows = key_rows.iloc[:, :5].copy()
+    key_rows.columns = ["row_name", "question", "response", "meta_value", "notes"]
+
+    df = key_rows.merge(export, on="row_name", how="left")
+    df["row_name"] = df["row_name"].astype(str).str.strip()
+    df["value"] = df[total_col]
+    return df, total_col, outdoor_col
+
+
+def get_val(df: pd.DataFrame, row_name: str) -> float:
+    """Exact (case-insensitive) row_name lookup of the Total-column value."""
+    m = df[df["row_name"].str.lower() == row_name.lower()]
+    if m.empty:
         return 0.0
-    return float(matches.sum() if sum_matches else matches.iloc[0])
+    v = m["value"].iloc[0]
+    return float(v) if pd.notna(v) else 0.0
 
 
-def compute_derived(agg: dict) -> dict:
-    """Compute composite fields — identical to old pipeline."""
-    rc = max(agg.get("race_count", 1), 1)
-    # Combine three Black subgroups into one pct_black
-    agg["pct_black"] = float(np.clip(
-        (agg.get("n_black_cdn", 0) + agg.get("n_black_african", 0) + agg.get("n_black_caribbean", 0)) / rc,
-        0.0, 1.0
-    ))
-    # Also store the raw total for SASM's Y extraction
-    agg["n_black_total"] = (
-        agg.get("n_black_cdn", 0) + agg.get("n_black_african", 0) + agg.get("n_black_caribbean", 0)
-    )
-
-    ic = max(agg.get("indigenous_count", 1), 1)
-    agg["pct_indigenous"] = float(np.clip(
-        (agg.get("n_first_nations", 0) + agg.get("n_metis", 0) + agg.get("n_inuit", 0)) / ic,
-        0.0, 1.0
-    ))
-    # Also store the raw total for SASM's Y extraction
-    agg["n_indigenous_total"] = (
-        agg.get("n_first_nations", 0) + agg.get("n_metis", 0) + agg.get("n_inuit", 0)
-    )
-
-    # NEW: Compute education percentages
-    edu_total = max(
-        agg.get("n_less_than_hs", 0) + agg.get("n_hs_graduate", 0) + 
-        agg.get("n_some_post_sec", 0) + agg.get("n_post_sec_higher", 0),
-        1
-    )
-    agg["pct_less_than_hs"] = float(np.clip(agg.get("n_less_than_hs", 0) / edu_total, 0.0, 1.0))
-    agg["pct_hs_graduate"] = float(np.clip(agg.get("n_hs_graduate", 0) / edu_total, 0.0, 1.0))
-    agg["pct_some_post_sec"] = float(np.clip(agg.get("n_some_post_sec", 0) / edu_total, 0.0, 1.0))
-    agg["pct_post_sec_higher"] = float(np.clip(agg.get("n_post_sec_higher", 0) / edu_total, 0.0, 1.0))
-    
-    # NEW: Compute dependents percentage
-    total_surveyed = max(agg.get("total_surveyed", 1), 1)
-    agg["pct_has_dependents"] = float(np.clip(agg.get("n_has_dependents", 0) / total_surveyed, 0.0, 1.0))
-    
-    # NEW: Compute income type percentages
-    income_total = max(
-        agg.get("n_disability_income", 0) + agg.get("n_employment_income", 0) +
-        agg.get("n_welfare_income", 0) + agg.get("n_informal_income", 0) +
-        agg.get("n_other_income", 0),
-        1
-    )
-    agg["pct_disability_income"] = float(np.clip(agg.get("n_disability_income", 0) / income_total, 0.0, 1.0))
-    agg["pct_employment_income"] = float(np.clip(agg.get("n_employment_income", 0) / income_total, 0.0, 1.0))
-    agg["pct_welfare_income"] = float(np.clip(agg.get("n_welfare_income", 0) / income_total, 0.0, 1.0))
-    agg["pct_informal_income"] = float(np.clip(agg.get("n_informal_income", 0) / income_total, 0.0, 1.0))
-    agg["pct_other_income"] = float(np.clip(agg.get("n_other_income", 0) / income_total, 0.0, 1.0))
-
-    avg = max(agg.get("years_homeless_avg", 3.0), 0.1)
-    agg["pct_chronic"] = float(np.clip(1 - np.exp(-avg / 3.5), 0.1, 0.9))
-
-    agg["pct_other_race"] = float(np.clip(
-        1 - agg.get("pct_black", 0) - agg.get("pct_white", 0) - agg.get("pct_indigenous", 0),
-        0.01, 0.99
-    ))
-    agg["pct_trans_nonbinary"] = float(np.clip(
-        agg.get("pct_trans_male", 0) + agg.get("pct_trans_female", 0) +
-        agg.get("pct_two_spirit", 0) + agg.get("pct_nonbinary", 0),
-        0.01, 0.99
-    ))
-    agg.setdefault("age_std", 14.0)
-    return agg
-
-
-def apply_realistic_bounds(agg: dict, year: int) -> dict:
+def get_outdoor_fraction(df: pd.DataFrame, outdoor_col: str | None, total_col: str) -> float | None:
     """
-    Apply realistic bounds based on literature and domain knowledge.
-    
-    For years 2013-2017 (interpolated, no SNA data), use external prevalence
-    rates from published homeless health studies instead of interpolation.
-    
-    Later years (2018+) use clipping to constrain to literature ranges.
+    Fraction of ALL survey respondents surveyed in outdoor locations, read
+    directly from the Export sheet's per-sector columns at the TOTALSURVEYS
+    row. Returns None if the outdoor column or the row can't be found, so
+    the caller can apply a documented fallback.
     """
-    # External prevalence rates from published studies (CDC, CCSA, HUD, Burt 2005, Fazel & Geddes 2018)
-    # These are used for interpolated years (2013-2017) where SNA data is missing
-    EXTERNAL_RATES = {
-        2013: {'mental_health': 0.32, 'substance_use': 0.24, 'outdoor_sleeping': 0.14, 
-               'foster_care': 0.10, 'incarceration': 0.08},
-        2014: {'mental_health': 0.33, 'substance_use': 0.24, 'outdoor_sleeping': 0.15,
-               'foster_care': 0.10, 'incarceration': 0.08},
-        2015: {'mental_health': 0.34, 'substance_use': 0.25, 'outdoor_sleeping': 0.16,
-               'foster_care': 0.11, 'incarceration': 0.09},
-        2016: {'mental_health': 0.36, 'substance_use': 0.26, 'outdoor_sleeping': 0.17,
-               'foster_care': 0.11, 'incarceration': 0.09},
-        2017: {'mental_health': 0.38, 'substance_use': 0.27, 'outdoor_sleeping': 0.18,
-               'foster_care': 0.12, 'incarceration': 0.09},
+    if outdoor_col is None:
+        return None
+    row = df[df["row_name"].str.lower() == "totalsurveys"]
+    if row.empty:
+        return None
+    outdoor_val = row[outdoor_col].iloc[0]
+    total_val = row[total_col].iloc[0]
+    if pd.isna(outdoor_val) or pd.isna(total_val) or total_val <= 0:
+        return None
+    return float(np.clip(outdoor_val / total_val, 0.0, 1.0))
+
+
+def _renorm(*vals):
+    """Normalize a set of non-negative raw counts to sum to exactly 1.0."""
+    vals = [max(float(v), 0.0) for v in vals]
+    total = sum(vals)
+    if total <= 0:
+        return [0.0] * len(vals)
+    return [v / total for v in vals]
+
+
+def _years_homeless_from_ages(age_avg: float, age_first_homeless: float) -> float:
+    """Estimate lifetime years homeless as (current age) - (age first
+    experienced homelessness), floored to avoid zero/negative from noise."""
+    if age_avg <= 0 or age_first_homeless <= 0:
+        return 4.0  # fallback if either age figure is missing
+    return float(max(age_avg - age_first_homeless, 0.1))
+
+
+# ── YEAR-SPECIFIC EXTRACTION ──────────────────────────────────────────────────
+# Each function is hand-mapped to that year's VERIFIED real row names/schema.
+
+def extract_2013(df, total_col, outdoor_col) -> dict:
+    total_surveyed = get_val(df, "TOTALSURVEYS")
+    age_avg = get_val(df, "3_AGE")
+    # 2013 directly reports genuine lifetime years homeless (unlike 2018/2021,
+    # which only report time-homeless-in-the-past-12-months under a
+    # similarly-named row — see module docstring point 3).
+    years_homeless_avg = get_val(df, "1_YEARSHOMELESS") or 3.0
+
+    # Gender: Male/Female/Trans/Other, normalized to sum to 1.0. "Trans" and
+    # "Other" are folded into trans_nonbinary (2013's questionnaire doesn't
+    # distinguish further).
+    n_male = get_val(df, "4_MALE")
+    n_female = get_val(df, "4_FEMALE")
+    n_transnb = get_val(df, "4_TRANS") + get_val(df, "4_OTHER")
+    pct_male, pct_female, pct_trans_nonbinary = _renorm(n_male, n_female, n_transnb)
+
+    # Race: 2013 ONLY asks Aboriginal identity (yes/no). No Black/White
+    # breakdown exists at all this year — documented limitation.
+    n_ab_yes = get_val(df, "6A_YES")
+    n_ab_no = get_val(df, "6A_NO")
+    denom = n_ab_yes + n_ab_no
+    pct_indigenous = (n_ab_yes / denom) if denom > 0 else 0.0
+    pct_black = 0.0
+    pct_white = 0.0
+    pct_other_race = max(0.0, 1.0 - pct_indigenous)
+
+    # Education: not asked in 2013 at all.
+    edu = DEFAULT_EDUCATION
+
+    # Dependents: not asked in 2013 at all.
+    pct_has_dependents = DEFAULT_HAS_DEPENDENTS
+
+    # Mental health / substance use: 2013 has no direct status question.
+    # Best available proxy: "which of the following would help you find
+    # housing" — Mental health supports / Help getting alcohol or drug
+    # treatment. This measures PERCEIVED SERVICE NEED, not clinical
+    # self-identification — a real conceptual difference, used here only
+    # because nothing closer exists in this year's survey.
+    n_resp_total = get_val(df, "12A_RESPONSETOTAL")
+    pct_mental_health = (get_val(df, "12A_MENTALHEALTH") / n_resp_total) if n_resp_total > 0 else 0.0
+    pct_substance_use = (get_val(df, "12A_TREATMENT") / n_resp_total) if n_resp_total > 0 else 0.0
+
+    # Outdoor sleeping: from Export sheet's OUTDOOR sector column.
+    pct_outdoor = get_outdoor_fraction(df, outdoor_col, total_col)
+    if pct_outdoor is None:
+        pct_outdoor = 0.20  # fallback if column missing
+
+    pct_chronic = float(np.clip(1 - np.exp(-years_homeless_avg / 3.5), 0.1, 0.9))
+
+    # LGBTQ: available directly (Q5).
+    n_lgbtq_yes = get_val(df, "5_YES")
+    n_lgbtq_no = get_val(df, "5_NO")
+    lgbtq_denom = n_lgbtq_yes + n_lgbtq_no
+    pct_lgbtq = (n_lgbtq_yes / lgbtq_denom) if lgbtq_denom > 0 else 0.0
+
+    # No-income: available directly (Q13D).
+    n_no_income = get_val(df, "13D_NOINCOME")
+    n_income_total = get_val(df, "13D_RESPONSETOTAL")
+    pct_no_income = (n_no_income / n_income_total) if n_income_total > 0 else 0.0
+
+    return {
+        "total_surveyed": total_surveyed,
+        "age_avg": age_avg, "age_std": 14.0,
+        "years_homeless_avg": years_homeless_avg,
+        "pct_male": pct_male, "pct_female": pct_female, "pct_trans_nonbinary": pct_trans_nonbinary,
+        "pct_black": pct_black, "pct_white": pct_white, "pct_indigenous": pct_indigenous, "pct_other_race": pct_other_race,
+        "pct_less_than_hs": edu["less_than_hs"], "pct_hs_graduate": edu["hs_graduate"],
+        "pct_some_post_sec": edu["some_post_sec"], "pct_post_sec_higher": edu["post_sec_higher"],
+        "pct_has_dependents": pct_has_dependents,
+        "pct_mental_health": pct_mental_health, "pct_substance_use": pct_substance_use,
+        "pct_outdoor_sleeping": pct_outdoor, "pct_chronic": pct_chronic,
+        "pct_lgbtq": pct_lgbtq,
+        "pct_immigrant": DEFAULT_IMMIGRANT,
+        "pct_foster_care_history": DEFAULT_FOSTER_CARE,
+        "pct_incarceration_history": DEFAULT_INCARCERATION,
+        "pct_no_income": pct_no_income,
+        "pct_housing_loss_income": DEFAULT_HOUSING_LOSS_INCOME,
+        "pct_housing_loss_health": DEFAULT_HOUSING_LOSS_HEALTH,
     }
-    
-    # For early years, use external prevalence rates instead of interpolation
-    if year in EXTERNAL_RATES:
-        rates = EXTERNAL_RATES[year]
-        agg["pct_mental_health"] = float(rates['mental_health'])
-        agg["pct_substance_use"] = float(rates['substance_use'])
-        agg["pct_outdoor_sleeping"] = float(rates['outdoor_sleeping'])
-        agg["pct_foster_care_history"] = float(rates['foster_care'])
-        agg["pct_incarceration_history"] = float(rates['incarceration'])
-    else:
-        # For 2018+, use literature-based bounds (clipping)
-        # Mental health: literature range 15-60%
-        agg["pct_mental_health"] = float(np.clip(agg.get("pct_mental_health", 0.35), 0.15, 0.60))
-        
-        # Substance use: literature range 15-45%
-        agg["pct_substance_use"] = float(np.clip(agg.get("pct_substance_use", 0.25), 0.15, 0.45))
-        
-        # Outdoor sleeping: literature range 10-35%
-        agg["pct_outdoor_sleeping"] = float(np.clip(agg.get("pct_outdoor_sleeping", 0.18), 0.10, 0.35))
-        
-        # Foster care history: literature range 5-30%
-        agg["pct_foster_care_history"] = float(np.clip(agg.get("pct_foster_care_history", 0.12), 0.05, 0.30))
-        
-        # Incarceration history: literature range 5-25%
-        agg["pct_incarceration_history"] = float(np.clip(agg.get("pct_incarceration_history", 0.08), 0.05, 0.25))
-    
+
+
+def extract_2018(df, total_col, outdoor_col) -> dict:
+    total_surveyed = get_val(df, "TOTALSURVEYS")
+    age_avg = get_val(df, "2_AGEAVERAGE")
+    age_first_homeless = get_val(df, "3_AGEHOMELESSAVERAGE")
+    years_homeless_avg = _years_homeless_from_ages(age_avg, age_first_homeless)
+
+    # Gender: 2018 has a real GENDERCOUNT denominator, but we renormalize
+    # from raw category counts regardless, for robustness against exactly
+    # what that denominator does/doesn't include.
+    n_male = get_val(df, "15_MALE")
+    n_female = get_val(df, "15_FEMALE")
+    n_transnb = (get_val(df, "15_TRANSFEMALE") + get_val(df, "15_TRANSMALE")
+                 + get_val(df, "15_TWOSPIRIT") + get_val(df, "15_GENDERQUEER") + get_val(df, "15_OTHER"))
+    pct_male, pct_female, pct_trans_nonbinary = _renorm(n_male, n_female, n_transnb)
+
+    # Race: single "racial or ethnic group" question (Q12), all four
+    # categories derived from it and renormalized together.
+    n_white = get_val(df, "12_WHITE")
+    n_black = get_val(df, "12_BLACKAFRICAN") + get_val(df, "12_BLACKCARIBBEAN") + get_val(df, "12_BLACKOTHER")
+    n_indigenous = get_val(df, "12_INDIGENOUS")
+    n_other = (get_val(df, "12_HISPANIC") + get_val(df, "12_ASIAN") + get_val(df, "12_ARAB")
+               + get_val(df, "12_FILIPINO") + get_val(df, "12_MIXED"))
+    pct_black, pct_white, pct_indigenous, pct_other_race = _renorm(n_black, n_white, n_indigenous, n_other)
+
+    # Education: not asked in 2018 at all.
+    edu = DEFAULT_EDUCATION
+
+    # Dependents: "What family members are staying with you tonight?"
+    n_dep = get_val(df, "1_FAMILYHEAD")
+    n_fam_count = get_val(df, "1_FAMILYCOUNT")
+    pct_has_dependents = (n_dep / n_fam_count) if n_fam_count > 0 else DEFAULT_HAS_DEPENDENTS
+
+    # Mental health / substance use ("addiction"): Q19, shared denominator.
+    health_count = get_val(df, "19_HEALTHCOUNT")
+    pct_mental_health = (get_val(df, "19_MENTALYES") / health_count) if health_count > 0 else 0.0
+    pct_substance_use = (get_val(df, "19_ADDICTIONYES") / health_count) if health_count > 0 else 0.0
+
+    # Outdoor sleeping: from Export sheet's OUTDOORS sector column (the
+    # in-survey "9_OUTDOORS" row asks a different, retrospective question
+    # about winter-respite-service users and is NOT used here).
+    pct_outdoor = get_outdoor_fraction(df, outdoor_col, total_col)
+    if pct_outdoor is None:
+        pct_outdoor = 0.20
+
+    pct_chronic = float(np.clip(1 - np.exp(-years_homeless_avg / 3.5), 0.1, 0.9))
+
+    # LGBTQ (Q16)
+    n_straight = get_val(df, "16_HETEROSEXUAL")
+    n_lgbtq = (get_val(df, "16_GAY") + get_val(df, "16_LESBIAN") + get_val(df, "16_BISEXUAL")
+               + get_val(df, "16_TWOSPIRIT") + get_val(df, "16_QUESTIONING") + get_val(df, "16_QUEER") + get_val(df, "16_OTHER"))
+    lgbtq_denom = n_straight + n_lgbtq
+    pct_lgbtq = (n_lgbtq / lgbtq_denom) if lgbtq_denom > 0 else 0.0
+
+    # Immigrant (Q10)
+    n_no_immig = get_val(df, "10_NO")
+    n_immig = get_val(df, "10_IMMIGRANT") + get_val(df, "10_REFUGEE") + get_val(df, "10_REFUGEECLAIMANT") + get_val(df, "10_TEMP")
+    immig_denom = n_no_immig + n_immig
+    pct_immigrant = (n_immig / immig_denom) if immig_denom > 0 else DEFAULT_IMMIGRANT
+
+    # Foster care (Q18)
+    n_foster_yes = get_val(df, "18_YES")
+    n_foster_no = get_val(df, "18_NO")
+    foster_denom = n_foster_yes + n_foster_no
+    pct_foster_care_history = (n_foster_yes / foster_denom) if foster_denom > 0 else DEFAULT_FOSTER_CARE
+
+    # Incarceration (Q23)
+    n_prison_yes = get_val(df, "23_PRISONYES")
+    n_prison_no = get_val(df, "23_PRISONNO")
+    prison_denom = n_prison_yes + n_prison_no
+    pct_incarceration_history = (n_prison_yes / prison_denom) if prison_denom > 0 else DEFAULT_INCARCERATION
+
+    # No income (Q17)
+    n_no_income = get_val(df, "17_NONE")
+    n_income_total = get_val(df, "17_INCOMESOURCECOUNT")
+    pct_no_income = (n_no_income / n_income_total) if n_income_total > 0 else 0.0
+
+    return {
+        "total_surveyed": total_surveyed,
+        "age_avg": age_avg, "age_std": 14.0,
+        "years_homeless_avg": years_homeless_avg,
+        "pct_male": pct_male, "pct_female": pct_female, "pct_trans_nonbinary": pct_trans_nonbinary,
+        "pct_black": pct_black, "pct_white": pct_white, "pct_indigenous": pct_indigenous, "pct_other_race": pct_other_race,
+        "pct_less_than_hs": edu["less_than_hs"], "pct_hs_graduate": edu["hs_graduate"],
+        "pct_some_post_sec": edu["some_post_sec"], "pct_post_sec_higher": edu["post_sec_higher"],
+        "pct_has_dependents": pct_has_dependents,
+        "pct_mental_health": pct_mental_health, "pct_substance_use": pct_substance_use,
+        "pct_outdoor_sleeping": pct_outdoor, "pct_chronic": pct_chronic,
+        "pct_lgbtq": pct_lgbtq,
+        "pct_immigrant": pct_immigrant,
+        "pct_foster_care_history": pct_foster_care_history,
+        "pct_incarceration_history": pct_incarceration_history,
+        "pct_no_income": pct_no_income,
+        "pct_housing_loss_income": DEFAULT_HOUSING_LOSS_INCOME,
+        "pct_housing_loss_health": DEFAULT_HOUSING_LOSS_HEALTH,
+    }
+
+
+def extract_2021(df, total_col, outdoor_col) -> dict:
+    total_surveyed = get_val(df, "TotalSurveys")
+    age_avg = get_val(df, "2_AgeAverage")
+    age_first_homeless = get_val(df, "3_HomelessAgeAverage")
+    years_homeless_avg = _years_homeless_from_ages(age_avg, age_first_homeless)
+
+    # Gender (Q26)
+    n_male = get_val(df, "26_GenderIdentityMale")
+    n_female = get_val(df, "26_GenderIdentityFemale")
+    n_transnb = (get_val(df, "26_GenderIdentityTransMale") + get_val(df, "26_GenderIdentityTransFemale")
+                 + get_val(df, "26_GenderIdentityTwoSpirit") + get_val(df, "26_GenderIdentityNonBinary"))
+    pct_male, pct_female, pct_trans_nonbinary = _renorm(n_male, n_female, n_transnb)
+
+    # Race: single "racial identities" question (Q20) used for ALL FOUR
+    # categories (previously mixed with a separate Indigenous-identity
+    # question that has a different denominator — see module docstring).
+    n_white = get_val(df, "20_RaceEthnicityWhite")
+    n_black = (get_val(df, "20_RaceEthnicityBlackCanadianAmerican")
+               + get_val(df, "20_RaceEthnicityBlackAfrican") + get_val(df, "20_RaceEthnicityBlackAfroCaribbean"))
+    n_indigenous = get_val(df, "20_RaceEthnicityFirstNations")
+    n_other = (get_val(df, "20_RaceEthnicityArab") + get_val(df, "20_RaceEthnicityEastAsian")
+               + get_val(df, "20_RaceEthnicitySouthEastAsian") + get_val(df, "20_RaceEthnicitySouthAsian")
+               + get_val(df, "20_RaceEthnicityWestAsian") + get_val(df, "20_RaceEthnicityLatinAmerican")
+               + get_val(df, "20_RaceEthnicityOther"))
+    pct_black, pct_white, pct_indigenous, pct_other_race = _renorm(n_black, n_white, n_indigenous, n_other)
+
+    # Education (Q33): 7 real categories, mapped to 4 buckets and
+    # renormalized together (previous version only caught 2 of 7).
+    n_less_than_hs = (get_val(df, "33_EducationPrimarySchool") + get_val(df, "33_EducationNoEducation")
+                       + get_val(df, "33_EducationSomeHighSchool"))
+    n_hs_graduate = get_val(df, "33_EducationHighSchoolGraduate")
+    n_some_post_sec = get_val(df, "33_EducationSomePostSecondary")
+    n_post_sec_higher = get_val(df, "33_EducationPostSecondaryGraduate") + get_val(df, "33_EducationGraduateDegree")
+    pct_less_than_hs, pct_hs_graduate, pct_some_post_sec, pct_post_sec_higher = _renorm(
+        n_less_than_hs, n_hs_graduate, n_some_post_sec, n_post_sec_higher
+    )
+
+    # Dependents (Q1)
+    n_dep = get_val(df, "1_FamilyMembersTonightChildDep")
+    n_fam_count = get_val(df, "1_FamilyCount")
+    pct_has_dependents = (n_dep / n_fam_count) if n_fam_count > 0 else DEFAULT_HAS_DEPENDENTS
+
+    # Mental health / substance use (Q23)
+    health_count = get_val(df, "23_HealthChallengesCount")
+    pct_mental_health = (get_val(df, "23_MentalHealthIssueYes") / health_count) if health_count > 0 else 0.0
+    pct_substance_use = (get_val(df, "23_SubstanceUseIssueYes") / health_count) if health_count > 0 else 0.0
+
+    # Outdoor sleeping: from Export sheet's OUTDOORS sector column.
+    pct_outdoor = get_outdoor_fraction(df, outdoor_col, total_col)
+    if pct_outdoor is None:
+        pct_outdoor = 0.20
+
+    pct_chronic = float(np.clip(1 - np.exp(-years_homeless_avg / 3.5), 0.1, 0.9))
+
+    # LGBTQ (Q28)
+    lgbtq_count = get_val(df, "28_LGBTQS2Count")
+    pct_lgbtq = (get_val(df, "28_Yes") / lgbtq_count) if lgbtq_count > 0 else 0.0
+
+    # Immigrant (Q11)
+    immig_count = get_val(df, "11_ImmigrantStatusCount")
+    n_immig = get_val(df, "11_Immigrant") + get_val(df, "11_Refugee") + get_val(df, "11_RefugeeClaimant")
+    pct_immigrant = (n_immig / immig_count) if immig_count > 0 else DEFAULT_IMMIGRANT
+
+    # Foster care (Q22)
+    foster_count = get_val(df, "22_FosterCount")
+    pct_foster_care_history = (get_val(df, "22_Yes") / foster_count) if foster_count > 0 else DEFAULT_FOSTER_CARE
+
+    # Incarceration (Q32)
+    service_count = get_val(df, "32_ServiceUseCount")
+    pct_incarceration_history = (get_val(df, "32_PrisonOrJailYes") / service_count) if service_count > 0 else DEFAULT_INCARCERATION
+
+    # No income (Q29)
+    income_count = get_val(df, "29_IncomeCount")
+    pct_no_income = (get_val(df, "29_IncomeNoIncome") / income_count) if income_count > 0 else 0.0
+
+    # Housing loss reasons (Q6)
+    housing_loss_count = get_val(df, "6_HousingLossCount")
+    pct_housing_loss_income = (get_val(df, "6_HousingLossNotEnoughIncome") / housing_loss_count) if housing_loss_count > 0 else DEFAULT_HOUSING_LOSS_INCOME
+    pct_housing_loss_health = (get_val(df, "6_HousingLossMentalHealth") / housing_loss_count) if housing_loss_count > 0 else DEFAULT_HOUSING_LOSS_HEALTH
+
+    return {
+        "total_surveyed": total_surveyed,
+        "age_avg": age_avg, "age_std": 14.0,
+        "years_homeless_avg": years_homeless_avg,
+        "pct_male": pct_male, "pct_female": pct_female, "pct_trans_nonbinary": pct_trans_nonbinary,
+        "pct_black": pct_black, "pct_white": pct_white, "pct_indigenous": pct_indigenous, "pct_other_race": pct_other_race,
+        "pct_less_than_hs": pct_less_than_hs, "pct_hs_graduate": pct_hs_graduate,
+        "pct_some_post_sec": pct_some_post_sec, "pct_post_sec_higher": pct_post_sec_higher,
+        "pct_has_dependents": pct_has_dependents,
+        "pct_mental_health": pct_mental_health, "pct_substance_use": pct_substance_use,
+        "pct_outdoor_sleeping": pct_outdoor, "pct_chronic": pct_chronic,
+        "pct_lgbtq": pct_lgbtq,
+        "pct_immigrant": pct_immigrant,
+        "pct_foster_care_history": pct_foster_care_history,
+        "pct_incarceration_history": pct_incarceration_history,
+        "pct_no_income": pct_no_income,
+        "pct_housing_loss_income": pct_housing_loss_income,
+        "pct_housing_loss_health": pct_housing_loss_health,
+    }
+
+
+YEAR_EXTRACTORS = {2013: extract_2013, 2018: extract_2018, 2021: extract_2021}
+
+
+def apply_realistic_bounds(agg: dict) -> dict:
+    """Clip proportions to literature-supported ranges as a sanity check
+    against extraction errors. All years use real SNA survey data (or a
+    documented, labeled default where a question was never asked) — this
+    never substitutes external rates for real extracted data."""
+    agg["pct_mental_health"] = float(np.clip(agg.get("pct_mental_health", 0.35), 0.15, 0.60))
+    agg["pct_substance_use"] = float(np.clip(agg.get("pct_substance_use", 0.25), 0.15, 0.45))
+    agg["pct_outdoor_sleeping"] = float(np.clip(agg.get("pct_outdoor_sleeping", 0.18), 0.05, 0.40))
+    agg["pct_foster_care_history"] = float(np.clip(agg.get("pct_foster_care_history", 0.12), 0.05, 0.30))
+    agg["pct_incarceration_history"] = float(np.clip(agg.get("pct_incarceration_history", 0.08), 0.05, 0.25))
     return agg
 
 
@@ -327,121 +540,8 @@ def fetch_xlsx_from_api(year: int) -> bytes:
     raise ValueError(f"No xlsx resource found for SNA {year}.")
 
 
-def load_sna_xlsx(source) -> pd.DataFrame:
-    """Parse Export + Key-Rows sheets into a merged DataFrame."""
-    buf = io.BytesIO(source) if isinstance(source, bytes) else source
-    export = pd.read_excel(buf, sheet_name="Export")
-    export.columns = [str(c).strip() for c in export.columns]
-    row_col   = export.columns[0]
-    value_col = _pick_value_column(export.columns[1:])
-    export    = export[[row_col, value_col]].rename(columns={row_col: "row_name", value_col: "value"})
-
-    key_rows = pd.read_excel(buf, sheet_name="Key-Rows")
-    key_rows.columns = [str(c).strip() for c in key_rows.columns]
-    key_rows = key_rows.iloc[:, :5].copy()
-    key_rows.columns = ["row_name", "question", "response", "meta_value", "notes"]
-
-    df = key_rows.merge(export, on="row_name", how="left")
-    df["row_name"] = df["row_name"].astype(str).str.strip()
-    df["value"]    = pd.to_numeric(df["value"], errors="coerce")
-    return df
-
-
-def extract_aggregates(df: pd.DataFrame) -> dict:
-    """Extract all aggregate statistics from a loaded SNA sheet."""
-    lookup = df.assign(_rn=_normalize_series(df["row_name"])).set_index("_rn")["value"].to_dict()
-
-    def from_rows(*labels):
-        for label in labels:
-            v = lookup.get(_normalize_text(label))
-            if v is not None and not pd.isna(v):
-                return float(v)
-        return 0.0
-
-    agg = {key: from_rows(sna_row) for sna_row, key in ROW_MAP.items()}
-
-    # Semantic fallbacks for schema differences across years
-    agg["total_surveyed"] = max(agg.get("total_surveyed", 0.0),
-        _find_value(df, question_terms=("total surveys completed",), meta_value_terms=("count",)))
-    
-    # Years homeless — handle 2013 (1_YEARSHOMELESS), 2018 (4_TIMEHOMELESSAVERAGE in days), 2021 (4_YearHomelessAverage)
-    yh_2013 = from_rows("1_YEARSHOMELESS", "1_YEARSHOMELESSAVERAGE")
-    yh_2018 = from_rows("4_TIMEHOMELESSAVERAGE") / 365.0  # Convert days to years
-    yh_fallback = _find_value(df, question_terms=("how long you have been homeless",), meta_value_terms=("average",))
-    agg["years_homeless_avg"] = max(agg.get("years_homeless_avg", 0.0), yh_2013, yh_2018, yh_fallback)
-    
-    # Age — handle 2013 (3_AGE), 2018 (2_AGEAVERAGE), 2021 (2_AgeAverage)
-    age_2013 = from_rows("3_AGE")
-    age_2018 = from_rows("2_AGEAVERAGE")
-    age_fallback = _find_value(df, question_terms=("how old are you",), meta_value_terms=("average",))
-    agg["age_avg"] = max(agg.get("age_avg", 0.0), age_2013, age_2018, age_fallback)
-    
-    # Gender — handle 2013 (4_MALE/FEMALE), 2018 (15_MALE/FEMALE)
-    agg["n_male"] = max(agg.get("n_male", 0.0),
-        from_rows("4_MALE", "15_MALE"),
-        _find_value(df, question_terms=("gender",), response_terms=("male",), meta_value_terms=("count",)))
-    agg["n_female"] = max(agg.get("n_female", 0.0),
-        from_rows("4_FEMALE", "15_FEMALE"),
-        _find_value(df, question_terms=("gender",), response_terms=("female",), meta_value_terms=("count",)))
-    
-    agg["n_mental_health"] = max(agg.get("n_mental_health", 0.0),
-        _find_value(df, question_terms=("mental health",), response_terms=("yes",), meta_value_terms=("count",)))
-    agg["n_substance_use"] = max(agg.get("n_substance_use", 0.0),
-        _find_value(df, question_terms=("substance use",), response_terms=("yes",), meta_value_terms=("count",)))
-    agg["n_outdoor"] = max(agg.get("n_outdoor", 0.0),
-        _find_value(df, question_terms=("overnight location",), response_terms=("outdoor",), meta_value_terms=("count",)))
-    agg["n_white"] = max(agg.get("n_white", 0.0),
-        _find_value(df, question_terms=("race", "ethnicity"), response_terms=("white",), meta_value_terms=("count",)))
-    agg["n_lgbtq"] = max(agg.get("n_lgbtq", 0.0),
-        _find_value(df, question_terms=("lgbtq",), response_terms=("yes",), meta_value_terms=("count",)))
-    agg["n_foster"] = max(agg.get("n_foster", 0.0),
-        _find_value(df, question_terms=("foster",), response_terms=("yes",), meta_value_terms=("count",)))
-    agg["n_incarceration"] = max(agg.get("n_incarceration", 0.0),
-        _find_value(df, question_terms=("prison", "jail"), response_terms=("yes",), meta_value_terms=("count",)))
-    agg["n_no_income"] = max(agg.get("n_no_income", 0.0),
-        _find_value(df, question_terms=("income source",), response_terms=("no income",), meta_value_terms=("count",)))
-
-    # NEW: Extract education levels
-    n_less_than_hs = _find_value(df, question_terms=("education",), response_terms=("less than high school",), meta_value_terms=("count",))
-    n_hs_graduate = _find_value(df, question_terms=("education",), response_terms=("high school graduate",), meta_value_terms=("count",))
-    n_some_post_sec = _find_value(df, question_terms=("education",), response_terms=("some post-secondary",), meta_value_terms=("count",))
-    n_post_sec_higher = _find_value(df, question_terms=("education",), response_terms=("post-secondary or higher",), meta_value_terms=("count",))
-    
-    agg["n_less_than_hs"] = n_less_than_hs
-    agg["n_hs_graduate"] = n_hs_graduate
-    agg["n_some_post_sec"] = n_some_post_sec
-    agg["n_post_sec_higher"] = n_post_sec_higher
-    
-    # NEW: Extract dependents
-    n_has_dependents = _find_value(df, question_terms=("dependent",), response_terms=("yes",), meta_value_terms=("count",))
-    agg["n_has_dependents"] = n_has_dependents
-    
-    # NEW: Extract income types (consolidate multiple source types)
-    n_disability_income = _find_value(df, question_terms=("income source",), response_terms=("disability",), meta_value_terms=("count",))
-    n_employment_income = (_find_value(df, question_terms=("income source",), response_terms=("employment",), meta_value_terms=("count",)) +
-                           _find_value(df, question_terms=("income source",), response_terms=("full-time",), meta_value_terms=("count",)) +
-                           _find_value(df, question_terms=("income source",), response_terms=("part-time",), meta_value_terms=("count",)))
-    n_welfare_income = _find_value(df, question_terms=("income source",), response_terms=("welfare", "ontario works"), meta_value_terms=("count",))
-    n_informal_income = _find_value(df, question_terms=("income source",), response_terms=("informal",), meta_value_terms=("count",))
-    n_other_income = (_find_value(df, question_terms=("income source",), response_terms=("employment insurance", "child tax", "gst", "seniors",), meta_value_terms=("count",)) +
-                      _find_value(df, question_terms=("income source",), response_terms=("family", "friends",), meta_value_terms=("count",)) +
-                      _find_value(df, question_terms=("income source",), response_terms=("other",), meta_value_terms=("count",)))
-    
-    agg["n_disability_income"] = n_disability_income
-    agg["n_employment_income"] = n_employment_income
-    agg["n_welfare_income"] = n_welfare_income
-    agg["n_informal_income"] = n_informal_income
-    agg["n_other_income"] = n_other_income
-
-    for (num_key, den_key), pct_key in RATIO_MAP.items():
-        num = agg.get(num_key, 0.0)
-        den = max(agg.get(den_key, 1.0), 1.0)
-        agg[pct_key] = float(np.clip(num / den, 0.0, 1.0))
-
-    return compute_derived(agg)
-
-
 def load_all_years(use_local: bool = False) -> dict:
+    """Load and extract all three observed SNA years (2013, 2018, 2021)."""
     results = {}
     for year in PACKAGE_IDS:
         print(f"Loading SNA {year}...")
@@ -458,51 +558,12 @@ def load_all_years(use_local: bool = False) -> dict:
                 raise FileNotFoundError(f"Local file not found: {lp}")
             raw = lp.read_bytes()
             print(f"  [{year}] Loaded from local file.")
-        df_sheet = load_sna_xlsx(raw)
-        results[year] = extract_aggregates(df_sheet)
-        results[year]["year"] = year
+        df_sheet, total_col, outdoor_col = load_sna_xlsx(raw)
+        agg = YEAR_EXTRACTORS[year](df_sheet, total_col, outdoor_col)
+        agg = apply_realistic_bounds(agg)
+        agg["year"] = year
+        results[year] = agg
     return results
-
-
-# ── INTERPOLATION / EXTRAPOLATION ─────────────────────────────────────────────
-# Identical to old pipeline
-
-def interpolate_aggregates(observed: dict, all_years: list) -> pd.DataFrame:
-    obs_df = pd.DataFrame(observed).T.astype(float)
-    obs_df.index = obs_df.index.astype(int)
-    obs_df.index.name = "year"
-
-    interp = obs_df.reindex(pd.Index(all_years, name="year"))
-    interp = interp.interpolate(method="index", limit_direction="both")
-
-    obs_years = sorted(observed.keys())
-    first_yr, last_yr = obs_years[0], obs_years[-1]
-    span = last_yr - first_yr
-
-    for col in interp.columns:
-        if col == "year":
-            continue
-        v_first = observed[first_yr].get(col)
-        v_last  = observed[last_yr].get(col)
-        if v_first is None or v_last is None:
-            continue
-        slope = (v_last - v_first) / span if span else 0
-        for yr in all_years:
-            if yr > last_yr:
-                val = v_last + slope * (yr - last_yr)
-                if col in PROPORTION_COLS or col.startswith("pct_"):
-                    val = float(np.clip(val, 0.01, 0.99))
-                interp.loc[yr, col] = val
-
-    interp["total_surveyed"] = interp["total_surveyed"].round().astype(int)
-    return interp
-
-
-# ── REGION-YEAR FEATURES ──────────────────────────────────────────────────────
-# Same structure as old pipeline; column names match because SASM output
-# uses the same column names (mental_health, substance_use, etc.)
-
-
 
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
@@ -513,31 +574,21 @@ def main():
                         help="Load SNA xlsx locally instead of API")
     args = parser.parse_args()
 
-    all_years = list(range(2013, 2027))
-
-    # ── Step 1: Load SNA aggregates ───────────────────────────────────────────
     print("=" * 65)
-    print("STEP 1: Loading SNA aggregate data")
+    print("STEP 1: Loading SNA aggregate data (2013, 2018, 2021)")
     print("=" * 65)
     observed = load_all_years(use_local=args.local)
-    agg_df = interpolate_aggregates(observed, all_years)
 
-    # ── Step 2: Apply realistic bounds to SNA-derived proportions ────────────
-    print("\n" + "=" * 65)
-    print("STEP 2: Applying realistic bounds to SNA-derived proportions")
-    print("=" * 65)
-    for year in agg_df.index:
-        agg_df.loc[year] = apply_realistic_bounds(agg_df.loc[year].to_dict(), year)
+    agg_df = pd.DataFrame(observed).T.astype(float)
+    agg_df.index = agg_df.index.astype(int)
+    agg_df.index.name = "year"
+    agg_df["total_surveyed"] = agg_df["total_surveyed"].round().astype(int)
 
     print(agg_df[["total_surveyed", "pct_mental_health", "pct_outdoor_sleeping", "pct_chronic"]].round(3))
 
-    # ── Step 3: SASM individual generation ───────────────────────────────────
-    # This is the KEY difference from the old pipeline.
-    # Instead of copula sampling, we solve an integer optimization problem
-    # to find combination counts X' that minimize ||WX' - Y||²
     observed_years = sorted(observed.keys())
     print("\n" + "=" * 65)
-    print("STEP 3: SASM optimization-based individual generation")
+    print("STEP 2: SASM optimization-based individual generation")
     print("  (minimize ||WX' - Y||² per year)")
     print(f"  Using observed SNA years only: {observed_years}")
     print("=" * 65)
