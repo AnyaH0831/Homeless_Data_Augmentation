@@ -77,6 +77,31 @@ HEADER_MAP = {
     "institutional involvement": "institutional_involvement_raw",
 }
 
+# The columns from the SASM <-> Lanark mapping table that actually have a
+# usable Lanark counterpart (i.e. the ones used as the common schema in
+# merge_datasets.py). Columns from the mapping table with "No match" or
+# only a very weak match (race, education, lgbtq, foster_care_history,
+# shelter_type, immigrant, incarceration_history, housing_loss_income/health)
+# are intentionally excluded here since they don't have a real Lanark
+# source column. "year" is derived from last_contact_date's year (see
+# `clean()`) since Lanark has no single dedicated "year" field.
+FINAL_COLUMNS = [
+    "row_id",
+    "year",
+    "age",
+    "years_homeless",
+    "gender",
+    "has_dependents",
+    "mental_health",
+    "substance_use",
+    "outdoor_sleeping",
+    "chronic_homeless",
+    "youth",
+    "indigenous_flag",
+    "no_income",
+    "income_type",
+]
+
 
 def normalize_header(text):
     if text is None:
@@ -239,16 +264,17 @@ def clean(df):
         safe_col(df, "months_homeless_past_year"), errors="coerce"
     ) / 12.0
 
-    # --- Chronic homelessness flag ---
+    # --- Chronic homelessness flag (checkbox column: 'ü' = checked,
+    # blank = unchecked) ---
     df["chronic_homeless"] = (
         safe_col(df, "chronic_flag_raw").apply(to_lower_str)
-        .apply(lambda s: 1 if s == "chronic" else (0 if s == "---" else pd.NA))
+        .apply(lambda s: 1 if s == "ü" else 0)
     )
 
-    # --- Youth flag ---
+    # --- Youth flag (checkbox column: 'ü' = checked, blank = unchecked) ---
     df["youth"] = (
         safe_col(df, "youth_flag_raw").apply(to_lower_str)
-        .apply(lambda s: 1 if s == "youth" else (0 if s == "---" else pd.NA))
+        .apply(lambda s: 1 if s == "ü" else 0)
     )
 
     # --- Indigenous flag ---
@@ -279,25 +305,21 @@ def clean(df):
     # --- Income type ---
     df["income_type"] = safe_col(df, "income_type_raw")
 
-    # --- Incarceration / institutional history (broader than CSV concept) ---
-    df["incarceration_history"] = (
-        safe_col(df, "institutional_involvement_raw").apply(to_lower_str)
-        .apply(lambda s: 1 if "jail" in s or "incarcer" in s else 0)
-    )
-
-    # --- Immigrant proxy (asylum seeker is narrower than "immigrant") ---
-    df["immigrant_proxy_asylum_seeker"] = yes_no_to_flag(
-        safe_col(df, "asylum_seeker_raw")
-    )
-
-    # --- Shelter / housing status (kept as raw text; recode later if needed) ---
-    df["shelter_type_raw"] = safe_col(df, "sleeping_arrangement_raw")
-
     # Drop rows that turned out to be fully blank after all this (defensive).
     # (client_id is unusable here since it's blank in the source file --
     # see load_raw_rows -- so we rely on row_id, which is always set for
     # every row that passed the real-row check.)
     df = df.dropna(subset=["row_id"]).reset_index(drop=True)
+
+    # --- year: extracted from last_contact_date's year (no single
+    # "year" field exists in the Lanark data, so this is used as the
+    # closest available proxy) ---
+    df["year"] = pd.to_datetime(
+        safe_col(df, "last_contact_date"), errors="coerce"
+    ).dt.year
+
+    # Keep only the columns that are actually in the mapping table.
+    df = df[FINAL_COLUMNS]
 
     return df
 
